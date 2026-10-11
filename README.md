@@ -13,8 +13,7 @@ fast field cycling (FFC) relaxometry experiment?
 This code is a deliverable of the FC-RELAX doctoral network
 (see [Funding](#funding)).
 
-> **Script name.** This README refers to the script as `tfm_saddle_coil.py`.
-> Replace that with the actual file name in the repository.
+> **Script name.** This README refers to the script as `multimode_waterfall_coil.py`.
 
 ## Contents
 
