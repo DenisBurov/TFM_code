@@ -5,6 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import matplotlib as mpl
+from scipy.optimize import curve_fit
 import ezdxf
 
 MU0 = 4e-7*np.pi
@@ -19,9 +20,10 @@ def biot_savart_segments_weighted(P, seg_starts, seg_ends, Iseg):
     N = seg_starts.shape[0]
     B = np.zeros((M,3), dtype=float)
 
-    dl = seg_ends - seg_starts
+    dl      = seg_ends - seg_starts
+    midpts  = 0.5 * (seg_starts + seg_ends)
     for i in range(N):
-        r0 = seg_starts[i]
+        r0 = midpts[i]
         dli = dl[i]
         Ii = Iseg[i]
         if abs(Ii) < 1e-20:
@@ -219,7 +221,7 @@ if __name__ == "__main__":
     # =====================================================================
     
     # Coil dimensions
-    R = 0.005  # 5 mm radius
+    R = 0.0055  # 5 mm radius
     L = 0.02  # 11 mm height
 
     # RF physics (skin-effect resistance model)
@@ -231,7 +233,7 @@ if __name__ == "__main__":
 
     # Track specifications
     WIRE_WIDTH_MM = 0.5    # Fixed wire width in mm
-    NUM_TRACKS = 10        # Number of tracks (adjust as needed)
+    NUM_TRACKS = 8        # Number of tracks (adjust as needed)
 
     # Contour level fractions (must match levels_pos below)
     LEVEL_FRAC_OUTER = 0.1   # outermost contour level as fraction of ψ_max
@@ -982,6 +984,669 @@ if __name__ == "__main__":
             f'   |   coil R = {R*1000:.0f} mm, L = {L*1000:.0f} mm, '
             f'ROI ±{Z_sample*1000:.0f} mm',
             fontsize=16, y=1.01)
+
+    # =====================================================================
+    # VOXEL SIGNAL CALCULATION  (toggle with SHOW_VOXEL_SIGNAL)
+    #
+    # Discretise the cylindrical sample into voxels. Each voxel receives
+    # a flip angle θᵢ = (π/2) · B1(rᵢ)/⟨B1⟩  where t_pulse is calibrated
+    # for a 90° flip at the mean B1 (standard scanner calibration).
+    # Signal from voxel i:  sᵢ = sin(θᵢ)
+    # Total signal:          S  = Σᵢ sin(θᵢ)
+    # Ideal (homogeneous):   S₀ = N_voxels   (all sin 90° = 1)
+    # Efficiency:            S / S₀  [%]
+    # =====================================================================
+    SHOW_VOXEL_SIGNAL = True    # ← set False to skip
+    N_VOX_MODES_MAX   = 4       # sweep N = 1 … this value
+    N_VOX             = 20      # voxels per Cartesian axis  (20³ → ~6k inside)
+
+    if SHOW_VOXEL_SIGNAL:
+        sw_colors = ['#e41a1c', '#377eb8', '#4daf4a', "#9d4ca9ff"]
+
+        # --- Uniform 3-D Cartesian voxel grid inside the cylindrical sample ---
+        x_v = np.linspace(-R_sample, R_sample, N_VOX)
+        y_v = np.linspace(-R_sample, R_sample, N_VOX)
+        z_v = np.linspace(-Z_sample, Z_sample, N_VOX)
+        Xv, Yv, Zv = np.meshgrid(x_v, y_v, z_v, indexing='ij')
+        inside   = np.sqrt(Xv**2 + Yv**2) <= R_sample
+        vox_pts  = np.column_stack([Xv[inside], Yv[inside], Zv[inside]])
+        N_inside = len(vox_pts)
+        print(f"\nVoxel grid: {N_VOX}³ Cartesian, {N_inside} points inside cylinder")
+        print(f"  Sample: r ≤ {R_sample*1e3:.1f} mm, |z| ≤ {Z_sample*1e3:.1f} mm")
+
+        # --- Forward matrix at voxel points (separate from ROI matrix A_mat) ---
+        # A_mat is used only to find a_opt; A_vox evaluates field at voxels.
+        print(f"\nBuilding {N_VOX_MODES_MAX}-mode forward matrix at {N_inside} voxels "
+              f"(Biot-Savart, please wait)...")
+        A_vox = build_forward_matrix(N_VOX_MODES_MAX, R, L, vox_pts)
+
+        # --- Solve for N = 1..N_VOX_MODES_MAX and compute signal ---------------
+        vox_results = {}
+        for n in range(1, N_VOX_MODES_MAX + 1):
+            An    = A_mat[:, :n]
+            Gn    = mode_regularization(n, R, L)
+            AtAn  = An.T @ An
+            lam_n = LAMBDA_SPACING * np.trace(AtAn) / np.trace(Gn)
+            a_n   = np.linalg.solve(AtAn + lam_n * Gn, An.T @ b_vec)
+
+            B1_vox  = A_vox[:, :n] @ a_n           # [T] at each voxel
+            B1_mean = float(np.mean(B1_vox))
+            B1_norm = B1_vox / B1_mean              # mean = 1
+            theta   = (np.pi / 2) * B1_norm         # flip angle [rad]
+            signal  = np.sin(theta)
+
+            S_total = float(np.sum(signal))
+            S_ideal = float(N_inside)               # all voxels at 90°
+            eff     = S_total / S_ideal * 100
+            rms_vox = float(np.sqrt(np.mean((B1_norm - 1)**2))) * 100
+
+            vox_results[n] = {
+                'a_opt': a_n, 'B1_norm': B1_norm, 'theta': theta,
+                'signal': signal, 'S_total': S_total, 'eff': eff, 'rms': rms_vox,
+            }
+            print(f"  N={n}: RMS={rms_vox:.1f}%   S/S_ideal={eff:.3f}%   "
+                  f"(lost {100 - eff:.3f}%)")
+
+        # --- Figure A: flip angle maps for N=1 vs N=N_VOX_MODES_MAX ----------
+        # Colormap: per-N adaptive limits, symmetrised around 90°.
+        # A shared fixed range (e.g. 60–120°) makes N=4 look blank because
+        # its ±1–2° deviation is invisible on a ±30° scale.
+        figA, axsA = plt.subplots(2, 2, figsize=(14, 11))
+        iz0, iy0 = N_VOX // 2, N_VOX // 2     # central z-slice and y-slice
+
+        for col_idx, N_plot in enumerate([1, N_VOX_MODES_MAX]):
+            res      = vox_results[N_plot]
+            col      = sw_colors[N_plot - 1]
+            theta_3d = np.full(Xv.shape, np.nan)
+            theta_3d[inside] = np.degrees(res['theta'])
+
+            # Adaptive symmetric limits: max deviation across ALL voxels
+            max_dev  = np.nanmax(np.abs(theta_3d[inside] - 90))
+            max_dev  = max(max_dev, 0.5)          # floor at 0.5° so colorbar stays meaningful
+            vmin_deg = 90 - max_dev
+            vmax_deg = 90 + max_dev
+
+            # Horizontal slice at z = 0
+            ax = axsA[0, col_idx]
+            im = ax.pcolormesh(x_v * 1e3, y_v * 1e3,
+                               theta_3d[:, :, iz0].T,
+                               cmap='RdBu_r', vmin=vmin_deg, vmax=vmax_deg,
+                               shading='auto')
+            ax.add_patch(plt.Circle((0, 0), R_sample * 1e3,
+                                    fill=False, color='k', lw=1.5, ls='--'))
+            plt.colorbar(im, ax=ax, label=f'Flip angle [°]\n(90 ± {max_dev:.1f}°)')
+            ax.set_aspect('equal')
+            ax.set_xlabel('x [mm]'); ax.set_ylabel('y [mm]')
+            ax.set_title(f'N={N_plot}  —  horizontal slice  z = 0\n'
+                         f'RMS = {res["rms"]:.1f}%,   S/S₀ = {res["eff"]:.2f}%',
+                         color=col, fontweight='bold', fontsize=13)
+
+            # Vertical slice at y = 0
+            ax = axsA[1, col_idx]
+            im = ax.pcolormesh(x_v * 1e3, z_v * 1e3,
+                               theta_3d[:, iy0, :].T,
+                               cmap='RdBu_r', vmin=vmin_deg, vmax=vmax_deg,
+                               shading='auto')
+            for z_bnd in [-Z_sample * 1e3, Z_sample * 1e3]:
+                ax.axhline(z_bnd, color='k', ls='--', lw=1, alpha=0.5)
+            plt.colorbar(im, ax=ax, label='Flip angle [°]')
+            ax.set_xlabel('x [mm]'); ax.set_ylabel('z [mm]')
+            ax.set_title(f'N={N_plot}  —  vertical slice  y = 0',
+                         color=col, fontweight='bold', fontsize=13)
+
+        figA.suptitle(
+            'Flip angle maps   (white = 90°,  red = over-flipped,  blue = under-flipped)\n'
+            r'$\theta(\mathbf{r}) = \dfrac{\pi}{2} \cdot \dfrac{B_1(\mathbf{r})}{\langle B_1\rangle}$',
+            fontsize=14)
+        plt.tight_layout()
+
+        # --- Figure B: signal efficiency bar + flip angle histogram -----------
+        figB, axsB = plt.subplots(1, 2, figsize=(14, 6))
+
+        # Signal efficiency bar chart
+        Ns   = list(vox_results.keys())
+        effs = [vox_results[n]['eff'] for n in Ns]
+        ax   = axsB[0]
+        bars = ax.bar(Ns, effs, color=sw_colors[:len(Ns)], alpha=0.85, width=0.6)
+        ax.axhline(100, color='gray', ls='--', lw=1.5, label='Ideal (homogeneous)')
+        for bar, e in zip(bars, effs):
+            ax.text(bar.get_x() + bar.get_width() / 2, e + 0.05,
+                    f'{e:.2f}%', ha='center', va='bottom',
+                    fontsize=12, fontweight='bold')
+        ax.set_xlabel('Number of TFM modes  N', fontsize=14)
+        ax.set_ylabel('Signal efficiency   S / S₀  [%]', fontsize=14)
+        ax.set_title(
+            r'$S = \sum_\mathrm{vox} \sin\!\left(\frac{\pi}{2}\,\tilde{B}_i\right)$'
+            f'    ({N_inside} voxels, '
+            f'sample ∅{R_sample*2e3:.0f} × {Z_sample*2e3:.0f} mm)',
+            fontsize=13)
+        ax.set_ylim(min(effs) - 1, 101)
+        ax.legend(fontsize=12); ax.grid(axis='y', alpha=0.3)
+
+        # Flip angle histograms
+        ax = axsB[1]
+        for n in Ns:
+            ax.hist(np.degrees(vox_results[n]['theta']), bins=40, alpha=0.45,
+                    color=sw_colors[n - 1], density=True,
+                    label=f'N={n}   (RMS={vox_results[n]["rms"]:.1f}%)')
+        ax.axvline(90, color='k', ls='--', lw=2, label='90° target')
+        ax.set_xlabel('Flip angle  θ  [°]', fontsize=14)
+        ax.set_ylabel('Probability density', fontsize=14)
+        ax.set_title('Flip angle distribution across voxels', fontsize=14)
+        ax.legend(fontsize=12); ax.grid(True, alpha=0.3)
+
+        figB.suptitle(
+            f'Voxel signal analysis  —  coil R={R*1e3:.0f} mm, '
+            f'L={L*1e3:.0f} mm,  λ₀={LAMBDA_SPACING}', fontsize=14)
+        plt.tight_layout()
+
+    # =====================================================================
+    # SIGNAL MATRICES: N_modes (rows) × sample length (columns)
+    # Fixed coil designed for 10 mm sample; only the load volume changes.
+    # Pulse calibrated for 90° at mean B1 over each specific sample.
+    #
+    # Three views of the same B1 maps, because a single 90° pulse is a very
+    # insensitive probe of inhomogeneity:
+    #   (1) RMS of B1/⟨B1⟩            — the raw field error, first order
+    #   (2) single 90° pulse          — S/S₀ = Σ sin θᵢ / N   (second order:
+    #                                   S/S₀ ≈ 1 − (π²/8)·RMS², so 10 % RMS
+    #                                   costs only 0.11 dB)
+    #   (3) 90°–(180°)ⁿ echo train    — refocusing errors compound over the
+    #                                   train, so the same field error shows
+    #                                   up ~(1 + 2n)× larger in dB
+    # =====================================================================
+    SHOW_SIGNAL_MATRIX = True
+    N_VOX_MAT = 20   # voxels per axis (same density as voxel section)
+    N_ECHO_TRAIN = 8  # refocusing pulses in the multi-echo (CPMG-like) train
+
+    if SHOW_SIGNAL_MATRIX:
+        N_MODES_ROWS = [1, 2, 3, 4]
+        Z_FULL_COLS  = [5e-3, 10e-3, 15e-3, 20e-3]   # full sample lengths [m]
+
+        print("\n" + "="*70)
+        print("SIGNAL MATRIX: N_modes vs sample length (fixed coil, variable load)")
+        print("="*70)
+
+        # Optimal coefficients for each N using the coil's own ROI optimisation
+        a_nm = {}
+        for n in N_MODES_ROWS:
+            An   = A_mat[:, :n]
+            Gn   = mode_regularization(n, R, L)
+            AtAn = An.T @ An
+            lam_n = LAMBDA_SPACING * np.trace(AtAn) / np.trace(Gn)
+            a_nm[n] = np.linalg.solve(AtAn + lam_n * Gn, An.T @ b_vec)
+
+        sig_matrix  = np.zeros((len(N_MODES_ROWS), len(Z_FULL_COLS)))
+        rms_matrix  = np.zeros_like(sig_matrix)   # RMS of B1/⟨B1⟩ − 1  [%]
+        echo_matrix = np.zeros_like(sig_matrix)   # echo-train S/S₀  [fraction]
+        b1_maps     = {}                          # (i, j) → B1/⟨B1⟩, reused below
+
+        for j, Z_full in enumerate(Z_FULL_COLS):
+            Z_half = Z_full / 2.0
+            x_vm = np.linspace(-R_sample, R_sample, N_VOX_MAT)
+            y_vm = np.linspace(-R_sample, R_sample, N_VOX_MAT)
+            z_vm = np.linspace(-Z_half, Z_half, N_VOX_MAT)
+            Xvm, Yvm, Zvm = np.meshgrid(x_vm, y_vm, z_vm, indexing='ij')
+            inside_m = np.sqrt(Xvm**2 + Yvm**2) <= R_sample
+            vox_m    = np.column_stack([Xvm[inside_m], Yvm[inside_m], Zvm[inside_m]])
+            N_in     = len(vox_m)
+
+            print(f"\n  Sample {Z_full*1e3:.0f} mm full ({N_in} voxels) — building A_vox...")
+            A_vm = build_forward_matrix(max(N_MODES_ROWS), R, L, vox_m)
+
+            for i, n in enumerate(N_MODES_ROWS):
+                B1      = A_vm[:, :n] @ a_nm[n]
+                B1_norm = B1 / float(np.mean(B1))
+                b1_maps[(i, j)] = B1_norm
+                theta   = (np.pi / 2) * B1_norm
+                sig_matrix[i, j] = np.sum(np.sin(theta)) / N_in   # fraction [0..1]
+                rms_matrix[i, j] = np.sqrt(np.mean((B1_norm - 1)**2)) * 100
+
+                # Multi-echo train: 90° excitation then N_ECHO_TRAIN nominal
+                # 180° refocusing pulses, both scaled by the same local B1.
+                # Primary echo pathway only: each imperfect refocusing pulse of
+                # flip angle β keeps sin²(β/2) of the magnetisation, and the
+                # train multiplies. Pessimistic — a real phase-cycled CPMG
+                # recovers part of this through stimulated-echo pathways.
+                beta = np.pi * B1_norm
+                echo_amp = np.sin(theta) * np.sin(beta / 2.0)**(2 * N_ECHO_TRAIN)
+                echo_matrix[i, j] = np.sum(echo_amp) / N_in
+
+                print(f"    N={n}:  RMS = {rms_matrix[i, j]:6.3f} %   "
+                      f"S/S₀ = {sig_matrix[i, j]:.6f} "
+                      f"({20*np.log10(sig_matrix[i, j]):.4f} dB)   "
+                      f"echo×{N_ECHO_TRAIN} = {echo_matrix[i, j]:.6f} "
+                      f"({20*np.log10(max(echo_matrix[i, j], 1e-9)):.4f} dB)")
+
+        # --- Shared heatmap renderer (same layout for all three matrices) ----
+        def draw_matrix(data, cbar_label, cell_fmt, cmap, vmin, vmax, title):
+            figX, axX = plt.subplots(figsize=(11, 6))
+            imX = axX.imshow(data, aspect='auto', cmap=cmap, vmin=vmin, vmax=vmax)
+            cbX = plt.colorbar(imX, ax=axX, fraction=0.046, pad=0.04)
+            cbX.set_label(cbar_label, fontsize=13)
+
+            for i in range(data.shape[0]):
+                for j in range(data.shape[1]):
+                    norm_val = (data[i, j] - vmin) / max(vmax - vmin, 1e-9)
+                    rgba     = cmap(float(np.clip(norm_val, 0.0, 1.0)))
+                    lum      = 0.299*rgba[0] + 0.587*rgba[1] + 0.114*rgba[2]
+                    txt_col  = 'black' if lum > 0.45 else 'white'
+                    axX.text(j, i, cell_fmt.format(data[i, j]),
+                             ha='center', va='center',
+                             fontsize=14, fontweight='bold', color=txt_col)
+
+            axX.set_xticks(range(len(Z_FULL_COLS)))
+            axX.set_xticklabels([f'{Z*1e3:.0f} mm' for Z in Z_FULL_COLS], fontsize=14)
+            axX.set_yticks(range(len(N_MODES_ROWS)))
+            axX.set_yticklabels([f'N = {n}' for n in N_MODES_ROWS], fontsize=14)
+            axX.set_xlabel('Sample length  (full, along z)', fontsize=14)
+            axX.set_ylabel('TFM modes  N', fontsize=14)
+            axX.set_title(title, fontsize=13)
+            plt.tight_layout()
+            return figX, axX
+
+        coil_caption = (
+            f'\nFixed coil  R = {R*1e3:.0f} mm, L = {L*1e3:.0f} mm, '
+            f'lambda_0 = {LAMBDA_SPACING}   |   sample dia {R_sample*2e3:.0f} mm, '
+            f'variable length')
+
+        # --- Table 1: B1 inhomogeneity (RMS) --------------------------------
+        # First order in the field error, so this is the sensitive readout.
+        vmax_r = rms_matrix.max() * 1.05
+        draw_matrix(
+            rms_matrix,
+            'RMS of  $B_1/\\bar{B_1} - 1$   [%]',
+            '{:.2f} %',
+            plt.cm.RdYlGn_r, 0.0, vmax_r,
+            r'$B_1$ inhomogeneity   RMS$(B_i/\bar{B} - 1)$  [%]'
+            '    [first order — no pulse model]' + coil_caption)
+
+        # --- Table 2: single 90° pulse --------------------------------------
+        # Convert to dB for better contrast (20·log10 since S is amplitude-like)
+        sig_dB = 20.0 * np.log10(np.clip(sig_matrix, 1e-9, None))   # 0 dB = ideal
+        draw_matrix(
+            sig_dB,
+            '20·log₁₀(S / S₀)   [dB]',
+            '{:.3f} dB',
+            plt.cm.RdYlGn, sig_dB.min() - 0.1, 0.0,
+            f'NMR signal loss, single 90° pulse  20·log(S/S₀)  [dB]'
+            r'    [$\theta_i = (\pi/2)\,B_i/\bar{B}$]' + coil_caption)
+
+        # --- Table 3: multi-echo train --------------------------------------
+        echo_dB = 20.0 * np.log10(np.clip(echo_matrix, 1e-9, None))
+        draw_matrix(
+            echo_dB,
+            '20·log₁₀(S / S₀)   [dB]',
+            '{:.3f} dB',
+            plt.cm.RdYlGn, echo_dB.min() - 0.1, 0.0,
+            f'NMR signal loss, 90°–(180°)×{N_ECHO_TRAIN} echo train  '
+            f'20·log(S/S₀)  [dB]'
+            r'    [$S=\sum\sin\theta_i\,\sin^{2n}(\beta_i/2)$]' + coil_caption)
+
+        # =================================================================
+        # TABLE 4: FFC NP (non-polarized) sequence — precision penalty
+        #
+        # Ferrante & Sykora 2005, Sec. VIII.C, Fig. 21. The NP sequence
+        # prepares M0 = 0 by letting the sample relax in ZERO FIELD for the
+        # recycle delay RD; the magnet then switches to the relaxation field
+        # Br and dwells there for the variable time t, then switches to the
+        # acquisition field Ba, where ONE 90° RF pulse is applied and the FID
+        # acquired. Magnetisation preparation is done by the magnet, not by RF
+        # — there is exactly one RF pulse per block.
+        #
+        # Consequence for B1 inhomogeneity: that single read pulse is the same
+        # in every t-block, so a spread of flip angles is a t-INDEPENDENT
+        # multiplicative factor on the whole relaxation curve. Any fit with a
+        # free amplitude absorbs it exactly → ZERO bias on R = 1/T1. (The
+        # paper fits three parameters regardless, because switching intervals
+        # mean the curve starts neither at 0 nor ends at Ma — see Sec. VIII.D.)
+        #
+        # What the B1 spread does cost is FID amplitude, i.e. the S/N factor r
+        # in their Eq. (27):   ε ∝ 1 / (r·m·n·f_d·√n_b·√N)
+        # The relative error on the rate is LINEAR in 1/r, so
+        #     precision penalty  = S₀/S
+        #     extra scans needed = (S₀/S)²      (since ε ∝ 1/√N)
+        #
+        # NP FID amplitude, with reciprocity (one coil excites and receives):
+        #     S/S₀ = ⟨b · sin((π/2)·b)⟩,   b = B1/⟨B1⟩
+        # =================================================================
+        SHOW_NP_MATRIX = True
+
+        if SHOW_NP_MATRIX:
+            np_amp   = np.zeros_like(sig_matrix)   # FID amplitude, fraction
+            np_pen   = np.zeros_like(sig_matrix)   # precision penalty  [%]
+            np_scans = np.zeros_like(sig_matrix)   # extra scans to recover  [×]
+
+            print("\n" + "="*70)
+            print("FFC NP SEQUENCE: amplitude loss -> relaxation-rate precision")
+            print("="*70)
+
+            for i, n in enumerate(N_MODES_ROWS):
+                for j, Z_full in enumerate(Z_FULL_COLS):
+                    b     = b1_maps[(i, j)]
+                    alpha = (np.pi / 2) * b
+                    amp   = float(np.mean(b * np.sin(alpha)))   # excite × receive
+                    np_amp[i, j]   = amp
+                    np_pen[i, j]   = (1.0 / amp - 1.0) * 100
+                    np_scans[i, j] = 1.0 / amp**2
+
+                    print(f"  N={n}, {Z_full*1e3:2.0f} mm:  RMS = {rms_matrix[i, j]:6.3f} %"
+                          f"   S/S₀ = {amp:.4f}"
+                          f"   precision penalty = {np_pen[i, j]:+6.2f} %"
+                          f"   scans ×{np_scans[i, j]:.3f}")
+
+            # Check: the flip-angle spread is a t-independent scale factor, so a
+            # free-amplitude fit must return the true rate. Fit the scaled curve.
+            tau_chk = np.linspace(0.1, 4.0, 10)      # linear spread over ~4·T1
+            A_chk, B_chk = 1.0, 0.85                 # switching-limited endpoints
+            for i, n in enumerate(N_MODES_ROWS):
+                k = np_amp[i, -1]                    # worst cell's scale factor
+                S_chk = k * (A_chk - B_chk * np.exp(-tau_chk))
+                p3, _ = curve_fit(lambda t, a3, b3, T1: a3 - b3 * np.exp(-t / T1),
+                                  tau_chk, S_chk, p0=[k, k*B_chk, 1.0], maxfev=20000)
+                print(f"  bias check N={n} (scale {k:.4f}): "
+                      f"fitted T1 error = {(p3[2]-1)*100:+.2e} %")
+
+            vmax_p = max(np_pen.max() * 1.05, 1e-3)
+            draw_matrix(
+                np_pen,
+                'relaxation-rate precision penalty   [%]',
+                '{:+.2f} %',
+                plt.cm.RdYlGn_r, 0.0, vmax_p,
+                'FFC NP sequence — precision penalty on $R = 1/T_1$   '
+                r'[$\varepsilon \propto 1/r$, Ferrante & Sykora Eq. 27]'
+                '\n[single 90° read pulse → no bias on $T_1$, amplitude loss only]'
+                + coil_caption)
+
+        # =================================================================
+        # TABLE 5: FFC-IR (inversion recovery) sequence — precision penalty
+        #
+        # Ferrante & Sykora 2005, Sec. VIII.G, Fig. 28: prepolarize at Bp,
+        # switch to Ba, apply a 180° RF pulse to INVERT, switch to Br, relax
+        # for the variable time t, switch back to Ba, read with a 90° pulse.
+        # Two RF pulses per block instead of NP's one.
+        #
+        # Their headline advantage is the magnetization-variation factor
+        #     n = (Mmax − Mmin)/Mmax = 1 + Br/Bp   → up to 2
+        # which is stated "assuming ideal inversion". That assumption is
+        # exactly what a B1 spread breaks, and it is the reason IR — unlike
+        # NP — actually rewards a homogeneous coil.
+        #
+        # Per voxel, b = B1/⟨B1⟩:
+        #     β = π·b (inversion),  α = (π/2)·b (read),  receive weight b
+        #     Mz(0) = Mp·cos β      ← −Mp only if β is exactly 180°
+        #     Mz(t) = Mr + (Mp cos β − Mr)·e^(−t/T1)
+        #     s(t)  = b·sin α·Mz(t)
+        #
+        # Two aggregate factors follow:
+        #     W = ⟨b·sin α⟩                  amplitude (hits r; same as NP)
+        #     C = −⟨b·sin α·cos β⟩ / W       inversion efficiency (hits n)
+        # Ferrante & Sykora Eq. (27) has ε ∝ 1/(r·m·n·…), and m·n is just the
+        # signal swing over Ma, so relative to a perfectly homogeneous coil
+        #     swing factor = W·(C + w)/(1 + w),   w = Br/Bp
+        #     precision penalty = 1/(swing factor) − 1
+        # NP is the same expression with the inversion term absent (penalty
+        # = 1/W − 1), which is why NP is second-order-in-ε twice over and IR
+        # is not: cos β near 180° falls off ~4× faster than sin α near 90°
+        # (π²/2 vs π²/8 per unit mean-square B1 error).
+        #
+        # T1 itself is still unbiased — every voxel shares T1, so the sum
+        # stays mono-exponential and the 3-parameter fit absorbs both W and C.
+        # Verified numerically below.
+        # =================================================================
+        SHOW_IR_MATRIX = True
+        IR_W_RATIOS = [0.0, 0.1, 0.5]   # Br/Bp values to report
+        IR_W_PLOT   = 0.1               # the one that gets the heatmap
+
+        if SHOW_IR_MATRIX:
+            ir_pen = {w: np.zeros_like(sig_matrix) for w in IR_W_RATIOS}
+            ir_C   = np.zeros_like(sig_matrix)
+
+            print("\n" + "="*70)
+            print("FFC-IR SEQUENCE: inversion efficiency -> rate precision")
+            print("="*70)
+
+            for i, n in enumerate(N_MODES_ROWS):
+                for j, Z_full in enumerate(Z_FULL_COLS):
+                    b     = b1_maps[(i, j)]
+                    alpha = (np.pi / 2) * b
+                    beta  = np.pi * b
+                    wsin  = b * np.sin(alpha)
+                    W     = float(np.mean(wsin))
+                    C     = -float(np.mean(wsin * np.cos(beta))) / W
+                    ir_C[i, j] = C
+
+                    cells = []
+                    for w in IR_W_RATIOS:
+                        swing = W * (C + w) / (1.0 + w)
+                        ir_pen[w][i, j] = (1.0 / swing - 1.0) * 100
+                        cells.append(f"w={w}: {ir_pen[w][i, j]:+7.2f} %")
+
+                    print(f"  N={n}, {Z_full*1e3:2.0f} mm:  RMS = {rms_matrix[i, j]:6.3f} %"
+                          f"   W = {W:.4f}  C = {C:.4f}   "
+                          + "  ".join(cells)
+                          + f"   [NP: {np_pen[i, j]:+6.2f} %]")
+
+            # Bias check: W and C are both t-independent, so the 3-parameter
+            # fit must still recover T1 exactly even at the worst inversion.
+            tau_chk = np.linspace(0.1, 4.0, 10)
+            for i, n in enumerate(N_MODES_ROWS):
+                C_w = ir_C[i, -1]
+                S_chk = (IR_W_PLOT + C_w * np.exp(-tau_chk)) * np_amp[i, -1]
+                p3, _ = curve_fit(lambda t, a3, b3, T1: a3 - b3 * np.exp(-t / T1),
+                                  tau_chk, S_chk, p0=[IR_W_PLOT, -C_w, 1.0],
+                                  maxfev=20000)
+                print(f"  bias check N={n} (C = {C_w:.4f}): "
+                      f"fitted T1 error = {(p3[2]-1)*100:+.2e} %")
+
+            pen_plot = ir_pen[IR_W_PLOT]
+            draw_matrix(
+                pen_plot,
+                'relaxation-rate precision penalty   [%]',
+                '{:+.2f} %',
+                plt.cm.RdYlGn_r, 0.0, max(pen_plot.max() * 1.05, 1e-3),
+                f'FFC-IR sequence — precision penalty on $R = 1/T_1$   '
+                f'($B_r/B_p$ = {IR_W_PLOT})'
+                '\n[imperfect inversion degrades the $n$-factor '
+                r'$1 + B_r/B_p$ — compare NP table]' + coil_caption)
+
+    # =====================================================================
+    # MODEL vs ANALYTICAL COMPARISON  (toggle with SHOW_MODEL_COMPARISON)
+    # CST simulation data vs N=4 TFM analytical solution.
+    # "Y" in the dataset is the axial coordinate (rotated frame) → renamed Z.
+    # =====================================================================
+    SHOW_MODEL_COMPARISON = True
+
+    if SHOW_MODEL_COMPARISON:
+        # --- Embedded CST data (bg=30, gap=0.25) --------------------------
+        cst_x_mm = np.linspace(-5.0, 5.0, 101)
+        cst_bx_x = np.array([
+            0.93721174074924, 0.95322499825935, 0.96765742159474,
+            0.98229771299577, 0.99516818953399, 1.0071771353079,
+            1.0183281461677,  1.0235182014304,  1.0278687353699,
+            1.0315160963287,  1.0344759842572,  1.0358512792316,
+            1.0363364548488,  1.0359285471871,  1.0346251537999,
+            1.0322970511582,  1.0297615751869,  1.0272276065358,
+            1.0246949818269,  1.0218350988529,  1.0186800424702,
+            1.0156086243996,  1.0126205894547,  1.0097159396248,
+            1.0067520002465,  1.0044341563125,  1.0023091033375,
+            1.0001597959691,  0.99809776766202, 0.99612298815756,
+            0.99423567758918, 0.99271194112841, 0.99131827465638,
+            0.98996580348955, 0.98865403563475, 0.98738345232071,
+            0.98615372405089, 0.98496508918623, 0.98381746183710,
+            0.98271067519387, 0.98164496810277, 0.98062017417017,
+            0.97975674356051, 0.97933926581201, 0.97897313527992,
+            0.97865809201763, 0.97839436410384, 0.97817545432602,
+            0.97795463635690, 0.97777748608737, 0.97764351452185,
+            0.97755344934669, 0.97750680188775, 0.97797240236313,
+            0.97856980222606, 0.97921490937659, 0.97990755457788,
+            0.98064789389493, 0.98143559804507, 0.98227106852996,
+            0.98315430247671, 0.98408505458250, 0.98506340510962,
+            0.98608919188472, 0.98716290263852, 0.98828397179544,
+            0.98943257563197, 0.99061867245071, 0.99196689966032,
+            0.99345591594564, 0.99554331636173, 0.99771015462443,
+            0.99992297521958, 1.0021815314621,  1.0044862260479,
+            1.0068368941161,  1.0092332903778,  1.0116758186121,
+            1.0141643155456,  1.0166986180060,  1.0192788879130,
+            1.0221268245567,  1.0247712512504,  1.0271936178176,
+            1.0294783893846,  1.0313197594964,  1.0318033542933,
+            1.0323589348639,  1.0325085837837,  1.0322523802191,
+            1.0309250212305,  1.0259910476870,  1.0204801995499,
+            1.0143933542720,  1.0076516235762,  0.99983219559119,
+            0.99091429543713, 0.98089789599410, 0.96907708647955,
+            0.95287269688970, 0.93455173921517,
+        ])
+
+        # Z profile (originally labelled Y in CST — rotated coordinate system)
+        cst_z_mm = np.linspace(-5.0, 5.0, 101)
+        cst_bx_z = np.array([
+            0.93772183148847, 0.94337197229855, 0.94885147956056,
+            0.95416010567384, 0.95929785714120, 0.96426499487328,
+            0.96906118876932, 0.97368661629588, 0.97818410720950,
+            0.98096666933077, 0.98315773679158, 0.98529299057936,
+            0.98741430922615, 0.98943032694724, 0.99134148804462,
+            0.99314747867391, 0.99496280396217, 0.99679728109120,
+            0.99857216957218, 1.0002003494465,  1.0017622884850,
+            1.0032582322483,  1.0046880902038,  1.0060516041211,
+            1.0073491935579,  1.0085805190641,  1.0097456652174,
+            1.0108447182636,  1.0118775969967,  1.0129082279035,
+            1.0142305787521,  1.0154891915659,  1.0163082130941,
+            1.0167793336068,  1.0171046240521,  1.0172194674900,
+            1.0173234834739,  1.0174166946387,  1.0174989579449,
+            1.0175706402116,  1.0176313511697,  1.0178319330538,
+            1.0180413511825,  1.0182216108771,  1.0183726263019,
+            1.0184947381676,  1.0185876152610,  1.0186514372886,
+            1.0186861344130,  1.0186918099306,  1.0186684022173,
+            1.0186161915252,  1.0185208040413,  1.0183155699550,
+            1.0180949985310,  1.0180330857610,  1.0180197394142,
+            1.0180188471558,  1.0180304044129,  1.0180542382386,
+            1.0180905136780,  1.0181390583026,  1.0182001225640,
+            1.0182735346387,  1.0183593764376,  1.0184574768690,
+            1.0185679186555,  1.0186908693591,  1.0185500996387,
+            1.0182817985125,  1.0172256116527,  1.0155909925574,
+            1.0139133522977,  1.0121926215137,  1.0104289020903,
+            1.0086223829393,  1.0067729173052,  1.0048806143395,
+            1.0029452477229,  1.0013557766175,  0.99986570414462,
+            0.99832566593494, 0.99673603929812, 0.99509644291570,
+            0.99340742736262, 0.99165273073786, 0.98951067308509,
+            0.98726994617833, 0.98493043485221, 0.98249228830508,
+            0.98024477542433, 0.97810756649681, 0.97577196510770,
+            0.97323820053394, 0.96989990635766, 0.96576081492598,
+            0.96145250670856, 0.95697505105985, 0.95232896427097,
+            0.94751453448266, 0.94253224620664,
+        ])
+
+        # --- Analytical N=4 at the same grid positions --------------------
+        print("\nBuilding N=4 analytical profiles for model comparison...")
+        eval_x = np.column_stack([cst_x_mm * 1e-3, np.zeros(101), np.zeros(101)])
+        eval_z = np.column_stack([np.zeros(101),    np.zeros(101), cst_z_mm * 1e-3])
+        A_cmp  = build_forward_matrix(N_MODES, R, L, np.vstack([eval_x, eval_z]))
+
+        B1_cmp  = A_cmp @ a_opt
+        B1_x_an = B1_cmp[:101] / float(np.mean(B1_cmp[:101]))   # normalise by 1-D line mean
+        B1_z_an = B1_cmp[101:] / float(np.mean(B1_cmp[101:]))
+
+        res_x_an = cst_bx_x - B1_x_an
+        res_z_an = cst_bx_z - B1_z_an
+        print(f"  Analytical X residual:  max|Δ| = {np.max(np.abs(res_x_an)):.4f},  "
+              f"RMS = {np.sqrt(np.mean(res_x_an**2))*100:.2f}%")
+        print(f"  Analytical Z residual:  max|Δ| = {np.max(np.abs(res_z_an)):.4f},  "
+              f"RMS = {np.sqrt(np.mean(res_z_an**2))*100:.2f}%")
+
+        # --- Discrete contour Biot-Savart at the same grid positions ---------
+        # Each contour path in contour_data is a physical wire on the cylinder.
+        # Current per wire = ΔΨ (stream-function step between adjacent levels),
+        # signed by the level to give the correct current direction.
+        print(f"\nBuilding discrete-contour profiles for model comparison "
+              f"({len(contour_data)} contours)...")
+
+        delta_psi_step = ((levels_pos[-1] - levels_pos[0]) / max(n_per_side - 1, 1)
+                          if n_per_side > 1 else levels_pos[0])
+
+        # Finite-width strip model: N_W filaments at midpoint positions of equal sub-strips,
+        # each carrying I/N_W.  Width direction: ŵ = n̂ × t̂ (tangent to surface, ⊥ to wire).
+        CST_TRACK_W = 0.3e-3   # m — strip width as modelled in CST
+        N_W         = 50        # sub-filaments across width (midpoint rule)
+        w_offsets   = CST_TRACK_W * (-0.5 + (np.arange(N_W) + 0.5) / N_W)  # shape (N_W,)
+        I_sub       = delta_psi_step / N_W
+
+        d_starts, d_ends, d_I = [], [], []
+        for c in contour_data:
+            phi_c = c['phi_rad']
+            z_c   = c['z_mm'] * 1e-3
+            pts   = np.column_stack([R * np.cos(phi_c), R * np.sin(phi_c), z_c])
+
+            for k in range(len(pts) - 1):
+                P1, P2 = pts[k], pts[k + 1]
+                seg = P2 - P1
+                seg_len = np.linalg.norm(seg)
+                if seg_len < 1e-12:
+                    continue
+                t_hat = seg / seg_len
+
+                mid = 0.5 * (P1 + P2)
+                n_hat = np.array([mid[0], mid[1], 0.0])
+                n_hat /= np.linalg.norm(n_hat) + 1e-30
+
+                w_hat = np.cross(n_hat, t_hat)
+                wn = np.linalg.norm(w_hat)
+                w_hat = w_hat / wn if wn > 1e-10 else np.array([0.0, 0.0, 1.0])
+
+                for d in w_offsets:
+                    shift = d * w_hat
+                    d_starts.append(P1 + shift)
+                    d_ends.append(P2 + shift)
+                    d_I.append(I_sub)
+
+        d_starts = np.array(d_starts)
+        d_ends   = np.array(d_ends)
+        d_I      = np.array(d_I)
+        print(f"  Strip model: {CST_TRACK_W*1e3:.1f} mm wide, {N_W} sub-filaments, "
+              f"{len(d_starts)} total segments")
+
+        B_disc    = biot_savart_segments_weighted(
+                        np.vstack([eval_x, eval_z]), d_starts, d_ends, d_I)
+        B1_disc_x = B_disc[:101, 0] / float(np.mean(B_disc[:101, 0]))   # normalise by 1-D line mean
+        B1_disc_z = B_disc[101:, 0] / float(np.mean(B_disc[101:, 0]))
+
+        res_x_disc = cst_bx_x - B1_disc_x
+        res_z_disc = cst_bx_z - B1_disc_z
+        print(f"  Discrete X residual:  max|Δ| = {np.max(np.abs(res_x_disc)):.4f},  "
+              f"RMS = {np.sqrt(np.mean(res_x_disc**2))*100:.2f}%")
+        # Sanity check: discrete vs analytical (should differ on x, near-zero on z by symmetry)
+        print(f"  Discrete vs Analytical — X: max|Δ| = {np.max(np.abs(B1_disc_x - B1_x_an)):.4f}  "
+              f"Z: max|Δ| = {np.max(np.abs(B1_disc_z - B1_z_an)):.6f}  "
+              f"(z≈0 expected: azimuthal symmetry at axis)")
+        print(f"  Discrete Z residual:  max|Δ| = {np.max(np.abs(res_z_disc)):.4f},  "
+              f"RMS = {np.sqrt(np.mean(res_z_disc**2))*100:.2f}%")
+
+        # --- Figure -------------------------------------------------------
+        fig_cmp, axs = plt.subplots(1, 2, figsize=(18, 7))
+
+        for ax, x_mm, bx_cst, bx_an, bx_disc, xlabel, title in [
+            (axs[0], cst_x_mm, cst_bx_x, B1_x_an, B1_disc_x,
+             'x [mm]', 'Transverse profile  (y = 0, z = 0)'),
+            (axs[1], cst_z_mm, cst_bx_z, B1_z_an, B1_disc_z,
+             'z [mm]', 'Axial profile  (x = 0, y = 0)'),
+        ]:
+            ax.plot(x_mm, bx_cst,  'o', color='steelblue', ms=4, alpha=0.85,
+                    label='CST model  (bg=30, gap=0.25)')
+            ax.plot(x_mm, bx_an,   '-', color='crimson',   lw=2.5,
+                    label=f'Analytical  N={N_MODES} TFM (continuous sheet)')
+            ax.plot(x_mm, bx_disc, '--', color='darkorange', lw=2.2,
+                    label=f'Discrete contours  ({len(contour_data)} tracks)')
+            ax.axhline(1.0, color='gray', ls='--', lw=1.2, alpha=0.5)
+            ax.set_xlabel(xlabel,  fontsize=16)
+            ax.set_ylabel('$B_x$  /  $\\langle B_x \\rangle$', fontsize=16)
+            ax.set_title(title,    fontsize=16)
+            ax.legend(fontsize=14)
+            ax.grid(True, alpha=0.3)
+
+        fig_cmp.suptitle(
+            f'CST vs Analytical vs Discrete contours  —  {len(contour_data)} tracks, TFM N={N_MODES},  '
+            f'R={R*1e3:.0f} mm, L={L*1e3:.0f} mm,  lambda_0={LAMBDA_SPACING}',
+            fontsize=16)
+        plt.tight_layout()
 
     # Show all figures
     plt.show()
